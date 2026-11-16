@@ -25,7 +25,7 @@ jobs:
         run: python -m playwright install chromium
 
       - name: Build EXE
-        run: pyinstaller --noconfirm --onedir --name KavirTireBot kavirtirebot_windowsbuild/KoVirTireBot.py
+        run: pyinstaller --noconfirm --onedir --name KavirTireBot --add-data "$env:LOCALAPPDATA/ms-playwright;pw-browsers" kavirtirebot_windowsbuild/KoVirTireBot.py
 
       - name: Upload build
         uses: actions/upload-artifact@v4
