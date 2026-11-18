@@ -1,218 +1,349 @@
 # -*- coding: utf-8 -*-
-"""KoVir Tire stock watcher. User selects/enters tire and quantity."""
-import queue, threading, time, tkinter as tk, re, os, sys
-from tkinter import ttk, messagebox, simpledialog
-from datetime import datetime
+"""
+KoVir Tire stock watcher (Windows 10)
+Monitors only Special KB2000 / 175/60R13.
+Uses the site's visible "بروزرسانی موجودی" control every 4 seconds.
+It does NOT bypass CAPTCHA, OTP, queues, or payment security.
+"""
+import queue
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime, time as dtime
 from pathlib import Path
+import re
+import sys
 
-# When packaged as a one-file EXE, use the bundled Playwright Chromium runtime.
-if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(Path(sys._MEIPASS) / "pw-browsers")
-
-SALES_URL = "https://kavirtire.ir/esale/products"
-CATALOG_URL = "https://kavirtire.ir/products"
+URL = "https://kavirtire.ir/esale/products"
+PRODUCT = "Special KB2000"
+SIZE = "175/60R13"
 REFRESH_TEXT = "بروزرسانی موجودی"
-ADD_RE = re.compile(r"افزودن به سبد خرید|افزودن به سبد")
+ADD_TEXT = "افزودن به سبد خرید"
+SOLD_OUT_WORDS = ("اتمام موجودی", "ناموجود", "عدم موجودی", "موجود نیست", "فعلاً موجود نیست", "اتمام", "ناموجودی")
+BUY_WORDS = ("افزودن", "اضافه", "سبد", "خرید", "ثبت سفارش")
 INTERVAL_SECONDS = 4
-DEFAULT_SIZE = "165/60R13"
-DEFAULT_MODEL = "KB2000"
-DEFAULT_QUANTITY = 2
+START_TIME = dtime(7, 50)
+END_TIME = dtime(9, 0)
 
 class BotApp:
     def __init__(self, root):
         self.root = root
-        root.title("ربات پایش موجودی کویر تایر")
-        root.geometry("720x560")
-        root.minsize(650, 500)
-        self.commands, self.events = queue.Queue(), queue.Queue()
+        self.root.title("ربات پایش موجودی کویر تایر")
+        self.root.geometry("620x470")
+        self.root.minsize(560, 420)
+        self.commands = queue.Queue()
+        self.events = queue.Queue()
         self.worker = None
+        self.running = False
         self.browser_ready = False
-        self.products = []
-        self.selected = tk.StringVar()
-        self.quantity = tk.IntVar(value=DEFAULT_QUANTITY)
-        self.status = tk.StringVar(value="ابتدا مرورگر را باز کنید.")
-        self._build_ui()
-        root.after(250, self.poll_events)
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.preference_file = Path.home() / "KoVirTireBotProfile" / "hide_welcome_message.txt"
+        self.hide_welcome_message = self.preference_file.exists()
+        self.welcome_dialog = None
 
-    def _build_ui(self):
-        main = ttk.Frame(self.root, padding=14); main.pack(fill="both", expand=True)
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        main = ttk.Frame(root, padding=16)
+        main.pack(fill="both", expand=True)
+
         ttk.Label(main, text="پایش موجودی کویر تایر", font=("Tahoma", 17, "bold")).pack(anchor="e")
-        ttk.Label(main, text="انتخاب از فهرست سایت یا افزودن دستی محصول", font=("Tahoma", 10)).pack(anchor="e", pady=(4,10))
-        panel = ttk.LabelFrame(main, text="مشخصات محصول", padding=10); panel.pack(fill="x")
-        ttk.Label(panel, text="محصولات استخراج‌شده از سایت:").grid(row=0,column=1,sticky="e",padx=4,pady=5)
-        self.combo = ttk.Combobox(panel, textvariable=self.selected, state="readonly", width=45)
-        self.combo.grid(row=0,column=0,sticky="ew",padx=4,pady=5)
-        self.combo.bind("<<ComboboxSelected>>", self.on_select)
-        ttk.Button(panel,text="دریافت / تازه‌سازی فهرست سایت",command=self.refresh_catalog).grid(row=0,column=2,padx=4)
-        ttk.Label(panel,text="سایز:").grid(row=1,column=1,sticky="e",padx=4,pady=5)
-        self.size_entry=ttk.Entry(panel,width=22); self.size_entry.grid(row=1,column=0,sticky="w",padx=4,pady=5); self.size_entry.insert(0,DEFAULT_SIZE)
-        ttk.Label(panel,text="مدل / مشخصات:").grid(row=2,column=1,sticky="e",padx=4,pady=5)
-        self.model_entry=ttk.Entry(panel,width=22); self.model_entry.grid(row=2,column=0,sticky="w",padx=4,pady=5); self.model_entry.insert(0,DEFAULT_MODEL)
-        ttk.Label(panel,text="تعداد حلقه (۱ تا ۴):").grid(row=3,column=1,sticky="e",padx=4,pady=5)
-        self.qty_spin=ttk.Spinbox(panel,from_=1,to=4,textvariable=self.quantity,width=8); self.qty_spin.grid(row=3,column=0,sticky="w",padx=4,pady=5)
-        ttk.Button(panel,text="افزودن محصول دستی به فهرست",command=self.add_manual).grid(row=4,column=0,sticky="w",padx=4,pady=8)
-        panel.columnconfigure(0,weight=1)
-        ttk.Label(main,textvariable=self.status,font=("Tahoma",10,"bold"),foreground="#174f86",wraplength=670).pack(fill="x",pady=12)
-        buttons=ttk.Frame(main); buttons.pack(fill="x")
-        self.open_btn=ttk.Button(buttons,text="۱) باز کردن مرورگر و ورود",command=self.open_browser); self.open_btn.pack(side="right",padx=4)
-        self.start_btn=ttk.Button(buttons,text="۲) شروع پایش",command=self.start_monitor,state="disabled"); self.start_btn.pack(side="right",padx=4)
-        self.stop_btn=ttk.Button(buttons,text="توقف",command=self.stop_monitor,state="disabled"); self.stop_btn.pack(side="right",padx=4)
-        ttk.Label(main,text="گزارش فعالیت",font=("Tahoma",10,"bold")).pack(anchor="e",pady=(12,2))
-        self.log=tk.Text(main,height=11,wrap="word",font=("Consolas",9),state="disabled"); self.log.pack(fill="both",expand=True)
-        ttk.Label(main,text="بررسی موجودی هر ۴ ثانیه انجام می‌شود. ورود، کد پیامکی/CAPTCHA و پرداخت با خود کاربر است.",wraplength=670,font=("Tahoma",8)).pack(anchor="e",pady=6)
-        self._add_product(DEFAULT_SIZE,DEFAULT_MODEL)
-        self.combo.current(0)
+        ttk.Label(main, text="محصول هدف: KB2000  |  سایز پیش‌فرض: 175/60R13",
+                  font=("Tahoma", 10)).pack(anchor="e", pady=(8, 2))
+        ttk.Label(main, text="تعداد موردنظر: ۲ حلقه  |  فاصله بررسی: هر ۴ ثانیه",
+                  font=("Tahoma", 10)).pack(anchor="e")
 
-    def log_line(self,msg):
-        self.log.configure(state="normal"); self.log.insert("end",f"[{datetime.now():%H:%M:%S}] {msg}\n"); self.log.see("end"); self.log.configure(state="disabled")
+        self.status = tk.StringVar(value="مرورگر هنوز باز نشده است.")
+        ttk.Label(main, textvariable=self.status, font=("Tahoma", 11, "bold"),
+                  foreground="#174f86", wraplength=570).pack(fill="x", pady=14)
 
-    def _add_product(self,size,model):
-        size,model=size.strip(),model.strip()
-        if not size or not model: return
-        key=f"{size} | {model}"
-        if key not in [p["label"] for p in self.products]: self.products.append({"size":size,"model":model,"label":key})
-        self.combo["values"]=[p["label"] for p in self.products]
-        self.selected.set(key)
-        self.size_entry.delete(0,"end"); self.size_entry.insert(0,size)
-        self.model_entry.delete(0,"end"); self.model_entry.insert(0,model)
+        buttons = ttk.Frame(main)
+        buttons.pack(fill="x", pady=4)
+        self.open_btn = ttk.Button(buttons, text="۱) باز کردن مرورگر و ورود", command=self.open_browser)
+        self.open_btn.pack(side="right", padx=4)
+        self.start_btn = ttk.Button(buttons, text="۲) شروع پایش", command=self.start_monitor, state="disabled")
+        self.start_btn.pack(side="right", padx=4)
+        self.stop_btn = ttk.Button(buttons, text="توقف", command=self.stop_monitor, state="disabled")
+        self.stop_btn.pack(side="right", padx=4)
 
-    def on_select(self,_=None):
-        for p in self.products:
-            if p["label"]==self.selected.get():
-                self.size_entry.delete(0,"end"); self.size_entry.insert(0,p["size"])
-                self.model_entry.delete(0,"end"); self.model_entry.insert(0,p["model"]); break
+        ttk.Separator(main).pack(fill="x", pady=12)
+        ttk.Label(main, text="گزارش فعالیت", font=("Tahoma", 10, "bold")).pack(anchor="e")
+        self.log = tk.Text(main, height=12, wrap="word", font=("Consolas", 9), state="disabled")
+        self.log.pack(fill="both", expand=True, pady=6)
 
-    def add_manual(self):
-        size=self.size_entry.get().strip(); model=self.model_entry.get().strip()
-        if not re.fullmatch(r"\d{3}/\d{2}R\d{2}",size,re.I):
-            messagebox.showwarning("سایز نامعتبر","سایز را مثل 165/60R13 وارد کنید."); return
-        if not model: messagebox.showwarning("مدل خالی","نام مدل یا مشخصات را وارد کنید."); return
-        self._add_product(size,model); self.log_line(f"محصول دستی اضافه شد: {size} / {model}")
+        note = ("با اجرای برنامه، مرورگر و صفحه محصولات خودکار باز و فهرست یک‌بار به‌روزرسانی می‌شود؛ سپس وارد حساب شوید. "
+                "پایش در بازه ۰۷:۵۰ تا ۰۹:۰۰ به وقت محلی کامپیوتر انجام می‌شود. "
+                "پس از افزودن به سبد، برنامه متوقف می‌شود تا تعداد ۲ حلقه و سفارش را خودتان بررسی کنید.")
+        ttk.Label(main, text=note, wraplength=575, font=("Tahoma", 8)).pack(anchor="e", pady=(4, 0))
 
-    def refresh_catalog(self):
-        if self.worker and self.worker.is_alive():
-            self.commands.put("catalog"); self.status.set("در حال استخراج محصولات از صفحه کاتالوگ...")
-        else:
-            self.open_browser(); self.root.after(1200,lambda:self.commands.put("catalog"))
+        self.root.after(250, self.poll_events)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(500, self.open_browser)
+
+    def log_line(self, msg):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log.configure(state="normal")
+        self.log.insert("end", f"[{stamp}] {msg}\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
 
     def open_browser(self):
-        if self.worker and self.worker.is_alive(): return
-        self.status.set("در حال آماده‌سازی مرورگر..."); self.open_btn.configure(state="disabled")
-        self.worker=threading.Thread(target=self.browser_worker,daemon=True); self.worker.start()
+        if self.worker and self.worker.is_alive():
+            self.log_line("مرورگر/ربات از قبل فعال است.")
+            return
+        self.status.set("در حال آماده‌سازی مرورگر...")
+        self.open_btn.configure(state="disabled")
+        self.worker = threading.Thread(target=self.browser_worker, daemon=True)
+        self.worker.start()
 
     def start_monitor(self):
-        size=self.size_entry.get().strip(); model=self.model_entry.get().strip()
-        try: qty=int(self.quantity.get())
-        except Exception: qty=0
-        if not re.fullmatch(r"\d{3}/\d{2}R\d{2}",size,re.I) or not model or qty not in range(1,5):
-            messagebox.showwarning("مشخصات نامعتبر","سایز، مدل و تعداد ۱ تا ۴ را بررسی کنید."); return
-        self._add_product(size,model)
-        self.commands.put(("start",size,model,qty)); self.start_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
-        self.status.set(f"پایش {size} / {model} با تعداد {qty} حلقه")
+        if not self.browser_ready:
+            return
+        self.commands.put("start")
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.status.set("پایش درخواست شد؛ وضعیت صفحه بررسی می‌شود.")
 
-    def stop_monitor(self): self.commands.put("stop"); self.stop_btn.configure(state="disabled")
+    def stop_monitor(self):
+        self.commands.put("stop")
+        self.stop_btn.configure(state="disabled")
+        self.start_btn.configure(state="normal" if self.browser_ready else "disabled")
+        self.status.set("توقف پایش درخواست شد.")
 
     def browser_worker(self):
         try:
             from playwright.sync_api import sync_playwright
-            profile=Path.home()/"KoVirTireBotProfile"; profile.mkdir(exist_ok=True)
+            profile = Path.home() / "KoVirTireBotProfile"
+            profile.mkdir(exist_ok=True)
             with sync_playwright() as p:
-                context=p.chromium.launch_persistent_context(user_data_dir=str(profile),headless=False,viewport={"width":1365,"height":900},locale="fa-IR",args=["--start-maximized"])
-                page=context.pages[0] if context.pages else context.new_page()
-                page.goto(SALES_URL,wait_until="domcontentloaded",timeout=60000)
-                self.events.put(("ready","مرورگر باز شد. وارد حساب شوید و صفحه محصولات فروش را آماده کنید."))
-                monitoring=False; last_check=0; target=(DEFAULT_SIZE,DEFAULT_MODEL,DEFAULT_QUANTITY)
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=str(profile),
+                    headless=False,
+                    viewport={"width": 1365, "height": 900},
+                    locale="fa-IR",
+                    args=["--start-maximized"]
+                )
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    click_stock_refresh(page, timeout=5000)
+                    page.wait_for_timeout(1000)
+                    self.events.put(("log", "فهرست محصولات در شروع برنامه به‌روزرسانی شد."))
+                except Exception as refresh_error:
+                    self.events.put(("log", f"به‌روزرسانی اولیه انجام نشد؛ بعداً دوباره تلاش می‌شود: {str(refresh_error)[:120]}"))
+                self.events.put(("ready", "سایز و مشخصات لاستیک خود را انتخاب کنید و وارد حساب کاربری خود در سایت کویرتایر بشوید و وارد صفحه خرید بشوید سپس دکمه پایش را بزنید."))
+                monitoring = False
+                last_check = 0.0
                 while True:
                     try:
-                        cmd=self.commands.get(timeout=.25)
-                        if cmd=="stop": monitoring=False; self.events.put(("stopped","پایش متوقف شد."))
-                        elif isinstance(cmd,tuple) and cmd[0]=="start": target=(cmd[1],cmd[2],cmd[3]); monitoring=True; last_check=0; self.events.put(("log",f"پایش شروع شد: {target[0]} / {target[1]} / {target[2]} حلقه"))
-                        elif cmd=="catalog": self.scrape_catalog(context)
-                    except queue.Empty: pass
-                    if monitoring and time.monotonic()-last_check>=INTERVAL_SECONDS:
-                        last_check=time.monotonic(); size,model,qty=target
-                        try:
-                            refresh=page.get_by_text(REFRESH_TEXT,exact=False).first
-                            if not refresh.is_visible(timeout=1000): self.events.put(("log","دکمه بروزرسانی موجودی دیده نشد؛ صفحه فروش را باز کنید.")); continue
-                            refresh.click(timeout=3000); page.wait_for_timeout(800)
-                            card=find_product_card(page,size,model)
-                            if card is None: self.events.put(("log",f"کارت {size} / {model} پیدا نشد.")); continue
-                            text=card.inner_text(timeout=1500)
-                            if ADD_RE.search(text):
-                                qty_input=card.locator('input[type="number"], input[name*="quantity"], input[name*="qty"]')
-                                if qty_input.count():
-                                    try: qty_input.first.fill(str(qty),timeout=1500)
-                                    except Exception: pass
-                                add=card.get_by_text(ADD_RE,exact=False).first
-                                add.click(timeout=4000); monitoring=False
-                                self.events.put(("found",f"محصول موجود شد و درخواست افزودن {qty} حلقه ارسال شد. سبد خرید را خودتان بررسی کنید."))
-                            else: self.events.put(("log",f"{size} / {model}: هنوز ناموجود است."))
-                        except Exception as e: self.events.put(("log",f"خطای موقت: {str(e)[:180]}"))
-        except Exception as e: self.events.put(("fatal",f"خطا در اجرای مرورگر: {e}"))
+                        cmd = self.commands.get(timeout=0.25)
+                        if cmd == "start":
+                            monitoring = True
+                            last_check = 0.0
+                            self.events.put(("log", "پایش فعال شد."))
+                        elif cmd == "stop":
+                            monitoring = False
+                            self.events.put(("stopped", "پایش متوقف شد."))
+                    except queue.Empty:
+                        pass
 
-    def scrape_catalog(self,context):
-        try:
-            p=context.new_page(); p.goto(CATALOG_URL,wait_until="domcontentloaded",timeout=60000); p.wait_for_timeout(1200)
-            found=[]
-            size_re=re.compile(r"\b\d{3}/\d{2}R\d{2}\b",re.I)
-            model_re=re.compile(r"\bKB\s*[-]?\s*\d{2,4}\b",re.I)
-            # Product links on the official catalogue contain size, tread/model and KB code.
-            anchors=p.locator("a")
-            for i in range(min(anchors.count(),500)):
-                try: label=anchors.nth(i).inner_text(timeout=350)
-                except Exception: continue
-                sm=size_re.search(label); mm=model_re.search(label)
-                if sm and mm:
-                    item=(sm.group(0).upper(),mm.group(0).replace(" ","").upper())
-                    if item not in found: found.append(item)
-            # Fallback: inspect visible text around size strings if links were rendered unusually.
-            if not found:
-                body=p.locator("body").inner_text(timeout=10000)
-                lines=[x.strip() for x in body.splitlines() if x.strip()]
-                for i,line in enumerate(lines):
-                    sm=size_re.search(line)
-                    if sm:
-                        mm=model_re.search(" ".join(lines[max(0,i-1):min(len(lines),i+2)]))
-                        if mm:
-                            item=(sm.group(0).upper(),mm.group(0).replace(" ","").upper())
-                            if item not in found: found.append(item)
-            p.close()
-            if not found:
-                self.events.put(("log","از صفحه کاتالوگ محصول قابل تشخیصی استخراج نشد؛ می‌توانید محصول را دستی اضافه کنید.")); return
-            self.events.put(("catalog",found))
-        except Exception as e: self.events.put(("log",f"استخراج کاتالوگ ناموفق بود: {str(e)[:160]}"))
+                    if monitoring and (time.monotonic() - last_check >= INTERVAL_SECONDS):
+                        last_check = time.monotonic()
+                        now = datetime.now().time()
+                        if now < START_TIME:
+                            self.events.put(("log", "هنوز به ساعت شروع ۰۷:۵۰ نرسیده؛ منتظر می‌مانم."))
+                            continue
+                        if now > END_TIME:
+                            monitoring = False
+                            self.events.put(("stopped", "بازه پایش تمام شد (پس از ساعت ۰۹:۰۰)."))
+                            continue
+                        try:
+                            # Do not refresh the whole page: click the page's own stock-update control.
+                            click_stock_refresh(page, timeout=2500)
+                            page.wait_for_timeout(900)
+                            card = find_product_card(page)
+                            if card is None:
+                                self.events.put(("log", "کارت محصول KB2000 با سایز 175/60R13 پیدا نشد؛ صفحه محصولات و فیلترها را بررسی کنید."))
+                                continue
+                            candidate, reason = find_active_purchase_control(card)
+                            if candidate is not None:
+                                candidate.click(timeout=4000)
+                                monitoring = False
+                                self.events.put(("found", f"کنترل خرید فعال شناسایی شد ({reason}) و کلیک انجام شد. اکنون تعداد و اطلاعات سفارش را بررسی کنید."))
+                            else:
+                                self.events.put(("log", f"هنوز دکمه خرید فعال تشخیص داده نشد؛ {reason}"))
+                        except Exception as e:
+                            self.events.put(("log", f"خطای موقت صفحه: {str(e)[:180]}"))
+                # unreachable
+        except Exception as e:
+            self.events.put(("fatal", f"خطا در اجرای مرورگر: {e}"))
 
     def poll_events(self):
         try:
             while True:
-                kind,msg=self.events.get_nowait()
-                if kind=="catalog":
-                    for size,model in msg: self._add_product(size,model)
-                    self.log_line(f"{len(msg)} ترکیب سایز/مدل از صفحه کاتالوگ شناسایی شد. موارد را بازبینی کنید.")
-                    self.status.set("استخراج کاتالوگ تمام شد؛ محصول موردنظر را انتخاب کنید.")
-                else:
-                    self.log_line(msg)
-                    if kind=="ready": self.browser_ready=True; self.open_btn.configure(state="normal"); self.start_btn.configure(state="normal"); self.status.set(msg)
-                    elif kind in ("stopped","found"): self.status.set(msg); self.start_btn.configure(state="normal" if self.browser_ready else "disabled"); self.stop_btn.configure(state="disabled")
-                    elif kind=="fatal": self.status.set(msg); self.open_btn.configure(state="normal"); messagebox.showerror("خطا",msg)
-        except queue.Empty: pass
-        self.root.after(250,self.poll_events)
+                kind, msg = self.events.get_nowait()
+                self.log_line(msg)
+                if kind == "ready":
+                    self.browser_ready = True
+                    self.open_btn.configure(state="normal")
+                    self.start_btn.configure(state="normal")
+                    self.status.set(msg)
+                    if not self.hide_welcome_message:
+                        self.show_welcome_dialog()
+                elif kind == "found":
+                    self.running = False
+                    self.status.set("موجودی پیدا شد؛ برنامه برای بررسی سفارش متوقف شد.")
+                    self.start_btn.configure(state="disabled")
+                    self.stop_btn.configure(state="disabled")
+                    messagebox.showinfo("موجود شد", msg)
+                elif kind == "stopped":
+                    self.status.set(msg)
+                    self.start_btn.configure(state="normal" if self.browser_ready else "disabled")
+                    self.stop_btn.configure(state="disabled")
+                elif kind == "fatal":
+                    self.status.set(msg)
+                    self.open_btn.configure(state="normal")
+                    messagebox.showerror("خطا", msg)
+        except queue.Empty:
+            pass
+        self.root.after(250, self.poll_events)
 
-    def close(self): self.commands.put("stop"); self.root.destroy()
+    def show_welcome_dialog(self):
+        if self.welcome_dialog is not None and self.welcome_dialog.winfo_exists():
+            return
+        win = tk.Toplevel(self.root)
+        self.welcome_dialog = win
+        win.title("راهنمای شروع")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        win.geometry("510x230")
+        frame = ttk.Frame(win, padding=18)
+        frame.pack(fill="both", expand=True)
+        message = ("سایز و مشخصات لاستیک خود را انتخاب کنید و وارد حساب کاربری خود "
+                   "در سایت کویرتایر بشوید و وارد صفحه خرید بشوید سپس دکمه پایش را بزنید")
+        ttk.Label(frame, text=message, justify="right", anchor="e",
+                  wraplength=460, font=("Tahoma", 11)).pack(fill="x", pady=(4, 18))
+        dont_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="دیگر این پیام را نشان نده", variable=dont_show).pack(anchor="e", pady=(0, 16))
 
-def find_product_card(page,size,model):
-    # Search for both exact identifying strings, then walk ancestors for stock controls.
-    loc=page.get_by_text(model,exact=False)
-    for i in range(min(loc.count(),20)):
-        item=loc.nth(i)
-        for level in range(1,9):
-            anc=item.locator("xpath="+"/.."*level)
-            try: txt=anc.inner_text(timeout=700)
-            except Exception: continue
-            if size.lower() in txt.lower() and model.lower() in txt.lower() and ("اتمام موجودی" in txt or ADD_RE.search(txt)):
-                return anc
+        def dismiss():
+            if dont_show.get():
+                try:
+                    self.preference_file.parent.mkdir(parents=True, exist_ok=True)
+                    self.preference_file.write_text("1", encoding="utf-8")
+                    self.hide_welcome_message = True
+                except Exception as e:
+                    self.log_line(f"ذخیره تنظیم نمایش پیام انجام نشد: {str(e)[:100]}")
+            win.grab_release()
+            win.destroy()
+            self.welcome_dialog = None
+
+        ttk.Button(frame, text="متوجه شدم", command=dismiss).pack(anchor="center")
+        win.protocol("WM_DELETE_WINDOW", dismiss)
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def close(self):
+        self.commands.put("stop")
+        if self.welcome_dialog is not None:
+            try:
+                self.welcome_dialog.destroy()
+            except Exception:
+                pass
+        self.root.destroy()
+
+
+def click_stock_refresh(page, timeout=2500):
+    patterns = [
+        re.compile(r"بروزرسانی\s*موجودی|به.?روزرسانی\s*موجودی|تازه.?سازی\s*موجودی", re.I),
+        re.compile(r"بروزرسانی|به.?روزرسانی|تازه.?سازی", re.I),
+    ]
+    for pattern in patterns:
+        loc = page.get_by_text(pattern, exact=False)
+        for i in range(min(loc.count(), 8)):
+            item = loc.nth(i)
+            try:
+                if item.is_visible() and item.is_enabled():
+                    item.click(timeout=timeout)
+                    return
+            except Exception:
+                continue
+    raise RuntimeError("دکمه به‌روزرسانی موجودی پیدا نشد")
+
+
+def normalize_text(value):
+    return re.sub(r"\s+", " ", (value or "").replace("\u200c", " ").strip()).casefold()
+
+
+def find_product_card(page):
+    model = page.get_by_text(re.compile(r"KB\s*2000|KB2000|Special\s*KB2000", re.I), exact=False)
+    for i in range(min(model.count(), 10)):
+        item = model.nth(i)
+        try:
+            if not item.is_visible():
+                continue
+        except Exception:
+            continue
+        for level in range(1, 10):
+            ancestor = item.locator("xpath=" + "/.." * level)
+            try:
+                txt = normalize_text(ancestor.inner_text(timeout=700)).replace(" ", "")
+            except Exception:
+                continue
+            if "175/60R13" in txt:
+                try:
+                    if ancestor.locator("button, a, [role='button'], input[type='button'], input[type='submit']").count():
+                        return ancestor
+                except Exception:
+                    pass
+                return ancestor
     return None
 
-if __name__=="__main__":
-    root=tk.Tk(); app=BotApp(root); root.mainloop()
+
+def find_active_purchase_control(card):
+    selector = "button, a, [role='button'], input[type='button'], input[type='submit']"
+    controls = card.locator(selector)
+    for i in range(min(controls.count(), 30)):
+        el = controls.nth(i)
+        try:
+            if not el.is_visible():
+                continue
+            text = normalize_text(el.inner_text(timeout=500))
+            if not text:
+                text = normalize_text(el.get_attribute("value") or el.get_attribute("aria-label") or "")
+            aria_disabled = (el.get_attribute("aria-disabled") or "").lower() == "true"
+            disabled_attr = el.get_attribute("disabled") is not None
+            cls = normalize_text(el.get_attribute("class") or "")
+            if aria_disabled or disabled_attr or any(x in cls for x in ("disabled", "unavailable", "sold-out")):
+                continue
+            if any(normalize_text(word) in text for word in SOLD_OUT_WORDS):
+                continue
+            if any(normalize_text(word) in text for word in BUY_WORDS):
+                if el.is_enabled():
+                    return el, f"متن دکمه: {text[:55]}"
+            # Unknown wording: only accept a real enabled button with pointer cursor
+            # and a non-neutral background. Color alone is never sufficient.
+            state = el.evaluate("""e => {
+                const s=getComputedStyle(e), r=e.getBoundingClientRect();
+                return {disabled:!!e.disabled, pointer:s.cursor==='pointer',
+                        bg:s.backgroundColor.replace(/\\s/g,''), opacity:Number(s.opacity||1),
+                        visible:r.width>2 && r.height>2, tag:e.tagName.toLowerCase()};
+            }""")
+            neutral = state["bg"] in ("rgba(0,0,0,0)", "transparent", "rgb(255,255,255)", "rgb(248,249,250)", "rgb(245,245,245)")
+            if (state["tag"] == "button" and not state["disabled"] and state["visible"]
+                    and state["opacity"] >= 0.65 and state["pointer"] and not neutral):
+                return el, "دکمه فعال با متن جدید و ظاهر تعاملی"
+        except Exception:
+            continue
+    return None, "کنترل‌های موجود غیرفعال‌اند یا متن ناموجودی دارند"
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BotApp(root)
+    root.mainloop()
